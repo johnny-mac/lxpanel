@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2012-2014 Piotr Sipika; see the AUTHORS file for more.
+ * Copyright (c) 2012-2015 Piotr Sipika; see the AUTHORS file for more.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -56,17 +56,13 @@ struct _GtkWeatherClass
 
 GType       gtk_weather_get_type(void) G_GNUC_CONST;
 GtkWidget * gtk_weather_new(void);
-#ifdef USE_STANDALONE
-void        gtk_weather_run_preferences_dialog(GtkWidget * widget);
-void        gtk_weather_run_popup_menu(GtkWidget * widget);
-#endif
 void        gtk_weather_run_conditions_dialog(GtkWidget * widget);
 gchar *     gtk_weather_get_tooltip_text(GtkWidget * widget);
 GtkWidget * gtk_weather_create_preferences_dialog(GtkWidget * widget);
 
-/* if USE_STANDALONE is used then application should provide these functions */
 void weather_save_configuration(GtkWidget * pWeather, LocationInfo * pLocation);
-void weather_set_label_text(GtkWidget * pWeather, GtkWidget * label,
+void weather_set_label_text(GtkWidget * pWeather,
+                            GtkWidget * label,
                             const gchar * text);
 
 G_END_DECLS

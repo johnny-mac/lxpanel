@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2012-2014 Piotr Sipika; see the AUTHORS file for more.
+ * Copyright (c) 2012-2015 Piotr Sipika; see the AUTHORS file for more.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,82 +25,59 @@
 #include "forecast.h"
 #include "logutil.h"
 
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <locale.h>
+
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
 #include <libxml/xmlstring.h>
 #include <libxml/uri.h>
 
+#include <pthread.h>
+
+#include <glib.h>
+
 #include <gtk/gtk.h>
 #include <gio/gio.h>
 
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <locale.h>
-
-#define XMLCHAR_P(x) (xmlChar *)(x)
+#define XMLCHAR_P(x)      (xmlChar *)(x)
 #define CONSTXMLCHAR_P(x) (const xmlChar *)(x)
-#define CONSTCHAR_P(x) (const char *)(x)
-#define CHAR_P(x) (char *)(x)
+#define CONSTCHAR_P(x)    (const char *)(x)
+#define CHAR_P(x)         (char *)(x)
 
-static gint g_iInitialized = 0;
+#define WOEID_QUERY       "SELECT%20*%20FROM%20geo.placefinder%20WHERE%20text="
+#define FORECAST_QUERY_P1 "SELECT%20*%20FROM%20weather.forecast%20WHERE%20woeid="
+#define FORECAST_QUERY_P2 "%20and%20u="
+#define FORECAST_URL      "http://query.yahooapis.com/v1/public/yql?format=xml&q="
 
-static const gchar * WOEID_QUERY = "SELECT%20*%20FROM%20geo.placefinder%20WHERE%20text=";
-static const gchar * FORECAST_QUERY_P1 = "SELECT%20*%20FROM%20weather.forecast%20WHERE%20woeid=";
-static const gchar * FORECAST_QUERY_P2 = "%20and%20u=";
-static const gchar * FORECAST_URL = "http://query.yahooapis.com/v1/public/yql?format=xml&q=";
+/* the '7' is for two extra '%22' and a '\0' */
+#define WOEID_QUERY_LEN \
+  strlen(FORECAST_URL WOEID_QUERY) + 7
 
-/**
- * Returns the length for the appropriate WOEID query
- *
- * @param pczLocation Location string to be used inside query
- *
- * @return length of resulting query on success or 0 on failure
- */
-static gsize
-getWOEIDQueryLength(const gchar * pczLocation)
-{
-  // len of all strings plus two quotes ('%22') and \0
-  return strlen(FORECAST_URL) + 
-    strlen(WOEID_QUERY) + 
-    strlen(pczLocation) + 7;
-}
+/* all strings plus four quotes '%27', units char and a '\0' */
+#define FORECAST_QUERY_LEN \
+  strlen(FORECAST_URL FORECAST_QUERY_P1 FORECAST_QUERY_P2) + 14
 
-/**
- * Returns the length for the appropriate Forecast query
- *
- * @param pczWOEID WOEID string to be used inside query
- *
- * @return length of resulting query on success or 0 on failure
- */
-static gsize
-getForecastQueryLength(const gchar * pczWOEID)
-{
-  // len of all strings plus four quotes ('%27'), units char and \0
-  return strlen(FORECAST_URL) + 
-    strlen(FORECAST_QUERY_P1) + 
-    strlen(pczWOEID) + 14 +
-    strlen(FORECAST_QUERY_P2);
-}
+static gint g_initialized = 0;
 
 /**
  * Generates the WOEID query string
  *
- * @param cQuery Buffer to contain the query
- * @param pczLocation Location string
+ * @param query    Buffer to contain the query
+ * @param location Location string
  *
  * @return 0 on success, -1 on failure
  */
 static gint
-getWOEIDQuery(gchar * pcQuery, const gchar * pczLocation)
+woeid_query_gen(gchar * query, const gchar * location)
 {
-  gsize totalLength = getWOEIDQueryLength(pczLocation);
+  gsize totalsz = WOEID_QUERY_LEN + strlen(location);
   
-  snprintf(pcQuery, totalLength, "%s%s%s%s%s", 
-           FORECAST_URL, WOEID_QUERY, "%22", pczLocation, "%22");
-
-  pcQuery[totalLength] = '\0';
+  snprintf(query, totalsz, "%s%s%%22%s%%22",
+           FORECAST_URL, WOEID_QUERY, location);
 
   return 0;
 }
@@ -108,29 +85,21 @@ getWOEIDQuery(gchar * pcQuery, const gchar * pczLocation)
 /**
  * Generates the forecast query string
  *
- * @param cQuery Buffer to contain the query
- * @param pczWOEID WOEID string
- * @param czUnits Units character (length of 1)
+ * @param query Buffer to contain the query
+ * @param woeid WOEID string
+ * @param units Units character (length of 1)
  *
  * @return 0 on success, -1 on failure
  */
 static gint
-getForecastQuery(gchar * pcQuery, const gchar * pczWOEID, const gchar czUnits)
+forecast_query_gen(gchar * query, const gchar * woeid, const gchar units)
 {
-  gsize totalLength = getForecastQueryLength(pczWOEID);
-
-  snprintf(pcQuery, totalLength, "%s%s%s%s%s%s%s%c%s", 
-           FORECAST_URL, 
-           FORECAST_QUERY_P1,
-           "%22",
-           pczWOEID, 
-           "%22",
-           FORECAST_QUERY_P2,
-           "%22",
-           czUnits,
-           "%22");
-
-  pcQuery[totalLength] = '\0';
+  gsize totalsz = FORECAST_QUERY_LEN + strlen(woeid);
+ 
+  snprintf(query, totalsz, "%s%s%%22%s%%22%s%%22%c%%22",
+           FORECAST_URL,
+           FORECAST_QUERY_P1, woeid,
+           FORECAST_QUERY_P2, units);
 
   return 0;
 }
@@ -138,82 +107,79 @@ getForecastQuery(gchar * pcQuery, const gchar * pczWOEID, const gchar czUnits)
 /**
  * Converts the passed-in string from UTF-8 to ASCII for http transmisison.
  *
- * @param pczInString String to convert
+ * @param instr String to convert
  *
  * @return The converted string which MUST BE FREED BY THE CALLER.
  */
 static gchar *
-convertToASCII(const gchar *pczInString)
+locale_to_ascii(const gchar *instr)
 {
   // for UTF-8 to ASCII conversions
   setlocale(LC_CTYPE, "en_US");
 
   GError * pError = NULL;
 
-  gsize szBytesRead = 0;
-  gsize szBytesWritten = 0;
+  gsize readsz  = 0;
+  gsize writesz = 0;
 
-  gchar * pcConvertedString = g_convert(pczInString,
-                                        strlen(pczInString),
-                                        "ASCII//TRANSLIT",
-                                        "UTF-8",
-                                        &szBytesRead,
-                                        &szBytesWritten,
-                                        &pError);
+  gchar * outstr = g_convert(instr,
+                             strlen(instr),
+                             "ASCII//TRANSLIT",
+                             "UTF-8",
+                             &readsz,
+                             &writesz,
+                             &pError);
 
-  if (pError)
-    {
-      LXW_LOG(LXW_ERROR, "yahooutil::convertToASCII(%s): Error: %s", 
-              pczInString, pError->message);
+  if (pError) {
+    LXW_LOG(LXW_ERROR, "yahooutil::locale_to_ascii(%s): Error: %s", 
+            instr, pError->message);
 
-      g_error_free(pError);
+    g_error_free(pError);
 
-      pcConvertedString = g_strndup(pczInString, strlen(pczInString));
-    }
+    outstr = g_strndup(instr, strlen(instr));
+  }
 
   // now escape space, if any
-  xmlChar * pxEscapedString = xmlURIEscapeStr((const xmlChar *)pcConvertedString, NULL);
+  xmlChar * escapedstr = xmlURIEscapeStr((const xmlChar *)outstr, NULL);
 
-  if (pxEscapedString)
-    {
-      // release ConvertedString, reset it, then release EscapedString.
-      // I know it's confusing, but keeps everything as a gchar and g_free
-      g_free(pcConvertedString);
+  if (escapedstr) {
+    // release ConvertedString, reset it, then release EscapedString.
+    // I know it's confusing, but keeps everything as a gchar and g_free
+    g_free(outstr);
 
-      pcConvertedString = g_strndup((const gchar *)pxEscapedString, 
-                                    strlen((const gchar *)pxEscapedString));
+    outstr = g_strndup((const gchar *)escapedstr,
+                       strlen((const gchar *)escapedstr));
 
-      xmlFree(pxEscapedString);
-    }
+    xmlFree(escapedstr);
+  }
 
   // restore locale to default
   setlocale(LC_CTYPE, "");
 
-  return pcConvertedString;
+  return outstr;
 }
 
 /**
  * Compares two strings and then sets the storage variable to the second
  * value if the two do not match. The storage variable is cleared first.
  *
- * @param pcStorage Pointer to the storage location with the first value.
- * @param pczString2 The second string.
- * @param szString2 The length of the second string.
+ * @param dststr Pointer to the storage location with the first value.
+ * @param srcstr The second string.
+ * @param srclen The length of the second string.
  *
  * @return 0 on succes, -1 on failure.
  */
 static gint
-setStringIfDifferent(gchar ** pcStorage, 
-                     const gchar * pczString2,
-                     const gsize szString2)
+string_if_different_set(gchar ** dststr, 
+                        const gchar * srcstr,
+                        const gsize srclen)
 {
   // if diffrent, clear and set
-  if (g_strcmp0(*pcStorage, pczString2))
-    {
-      g_free(*pcStorage);
+  if (g_strcmp0(*dststr, srcstr)) {
+    g_free(*dststr);
 
-      *pcStorage = g_strndup(pczString2, szString2);
-    }
+    *dststr = g_strndup(srcstr, srclen);
+  }
 
   return 0;
 }
@@ -223,80 +189,80 @@ setStringIfDifferent(gchar ** pcStorage,
  * are different, the image at the 'new' URL is retrieved and replaces
  * the old one. The old one is freed.
  *
- * @param pcStorage Pointer to the storage location with the first value.
- * @param pImage Pointer to the image storage.
- * @param pczNewURL The new url.
- * @param szURLLength The length of the new URL.
+ * @param dsturl    Pointer to the storage location with the first value.
+ * @param image     Pointer to the image storage.
+ * @param newurl    The new url.
+ * @param newurllen The length of the new URL.
  *
  * @return 0 on succes, -1 on failure.
  */
 static gint
-setImageIfDifferent(gchar ** pcStorage,
-                    GdkPixbuf ** pImage,
-                    const gchar * pczNewURL,
-                    const gsize szURLLength)
+image_if_different_set(gchar       ** dsturl,
+                       GdkPixbuf   ** image,
+                       const gchar * newurl,
+                       const gsize newurllen)
 {
+  GInputStream * instream = NULL;
   int err = 0;
 
   // if diffrent, clear and set
-  if (g_strcmp0(*pcStorage, pczNewURL))
-    {
-      g_free(*pcStorage);
+  if (g_strcmp0(*dsturl, newurl)) {
+    g_free(*dsturl);
 
-      *pcStorage = g_strndup(pczNewURL, szURLLength);
+    *dsturl = g_strndup(newurl, newurllen);
 
-      if (*pImage)
-        {
-          g_object_unref(*pImage);
+    if (*image) {
+      g_object_unref(*image);
 
-          *pImage = NULL;
-        }
-      
-      // retrieve the URL and create the new image
-      gint iRetCode = 0;
-      gint iDataSize = 0;
-
-      gpointer pResponse = getURL(pczNewURL, &iRetCode, &iDataSize);
-
-      if (!pResponse || iRetCode != HTTP_STATUS_OK)
-        {
-          LXW_LOG(LXW_ERROR, "yahooutil::setImageIfDifferent(): Failed to get URL (%d, %d)", 
-                  iRetCode, iDataSize);
-
-          return -1;
-        }
-
-      GInputStream * pInputStream = g_memory_input_stream_new_from_data(pResponse,
-                                                                        iDataSize,
-                                                                        g_free);
-
-      GError * pError = NULL;
-
-      *pImage = gdk_pixbuf_new_from_stream(pInputStream,
-                                           NULL,
-                                           &pError);
-
-      if (!*pImage)
-        {
-          LXW_LOG(LXW_ERROR, "yahooutil::setImageIfDifferent(): PixBuff allocation failed: %s",
-                  pError->message);
-
-          g_error_free(pError);
-          
-          err = -1;
-        }
-
-      if (!g_input_stream_close(pInputStream, NULL, &pError))
-        {
-          LXW_LOG(LXW_ERROR, "yahooutil::setImageIfDifferent(): InputStream closure failed: %s",
-                  pError->message);
-
-          g_error_free(pError);
-
-          err = -1;
-        }
-      
+      *image = NULL;
     }
+      
+    // retrieve the URL and create the new image
+    gint rc      = 0;
+    gint datalen = 0;
+
+    gpointer response = httputil_url_get(newurl, &rc, &datalen);
+
+    if (!response || rc != HTTP_STATUS_OK) {
+      LXW_LOG(LXW_ERROR, "yahooutil::image_if_different_set(): Failed to get URL (%d, %d)", 
+              rc, datalen);
+
+      return -1;
+    }
+
+    instream = g_memory_input_stream_new_from_data(response,
+                                                   datalen,
+                                                   g_free);
+
+    GError * pError = NULL;
+
+    *image = gdk_pixbuf_new_from_stream(instream,
+                                        NULL,
+                                        &pError);
+
+    if (!*image) {
+      LXW_LOG(LXW_ERROR,
+              "yahooutil::image_if_different_set(): PixBuff allocation failed: %s",
+              pError->message);
+
+      g_error_free(pError);
+          
+      err = -1;
+    }
+
+    if (!g_input_stream_close(instream, NULL, &pError)) {
+      LXW_LOG(LXW_ERROR,
+              "yahooutil::image_if_different_set(): InputStream closure failed: %s",
+              pError->message);
+
+      g_error_free(pError);
+
+      err = -1;
+    } else {
+      g_object_unref(instream);
+    }
+      
+  }
 
   return err;
 }
@@ -305,203 +271,161 @@ setImageIfDifferent(gchar ** pcStorage,
  * Compares an integer to a converted string and then sets the storage variable
  * to the second value if the two do not match.
  *
- * @param piStorage Pointer to the storage location with the first value.
- * @param pczString2 The second string.
+ * @param dst    Pointer to the storage location with the first value.
+ * @param srcstr The second string.
  *
  * @return 0 on succes, -1 on failure.
  */
 static gint
-setIntIfDifferent(gint * piStorage, const gchar * pczString2)
+int_if_different_set(gint * dst, const gchar * srcstr)
 {
-  gint iValue = (gint)g_ascii_strtoll((pczString2)?pczString2:"0", NULL, 10);
+  gint value = (gint)g_ascii_strtoll((srcstr)?srcstr:"0", NULL, 10);
 
-  // if diffrent, set
-  if (*piStorage != iValue)
-    {
-      *piStorage = iValue;
-    }
-
+  /* set, regardless, the check is more expensive */
+  *dst = value;
+  
   return 0;
 }
 
 /**
  * Processes the passed-in node to generate a LocationInfo entry
  *
- * @param pNode Pointer to the XML Result Node.
+ * @param node Pointer to the XML Result Node.
  *
  * @return A newly created LocationInfo entry on success, or NULL on failure.
  */
 static gpointer
-processResultNode(xmlNodePtr pNode)
+result_node_process(xmlNodePtr node)
 {
-  if (!pNode)
-    {
-      return NULL;
-    }
+  if (!node) {
+    return NULL;
+  }
 
-  LocationInfo * pEntry = (LocationInfo *)g_try_new0(LocationInfo, 1);
+  LocationInfo * location = (LocationInfo *)g_try_new0(LocationInfo, 1);
 
-  if (!pEntry)
-    {
-      return NULL;
-    }
+  if (!location) {
+    return NULL;
+  }
 
-  xmlNodePtr pCurr = pNode->xmlChildrenNode;
+  xmlNodePtr curr = node->xmlChildrenNode;
 
-  for (; pCurr != NULL; pCurr = pCurr->next)
-    {
-      if (pCurr->type == XML_ELEMENT_NODE)
-        {
-          const char * pczContent = CONSTCHAR_P(xmlNodeListGetString(pCurr->doc, 
-                                                                     pCurr->xmlChildrenNode, 
-                                                                     1));
+  for (; curr != NULL; curr = curr->next) {
+    if (curr->type == XML_ELEMENT_NODE) {
+      const char * content = CONSTCHAR_P(xmlNodeListGetString(curr->doc, 
+                                                              curr->xmlChildrenNode, 
+                                                              1));
           
-          gsize contentLength = ((pczContent)?strlen(pczContent):0); // 1 is null char
+      gsize contentlen = ((content)?strlen(content):0); // 1 is null char
 
-          if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("city")))
-            {
-              pEntry->pcCity_ = g_strndup(pczContent, contentLength);
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("state")))
-            {
-              pEntry->pcState_ = g_strndup(pczContent, contentLength);
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("country")))
-            {
-              pEntry->pcCountry_ = g_strndup(pczContent, contentLength);
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("woeid")))
-            {
-              pEntry->pcWOEID_ = g_strndup(pczContent, contentLength);
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("line2")))
-            {
-              pEntry->pcAlias_ = g_strndup(pczContent, contentLength);
-            }
+      location_property_set(location,
+                            CONSTCHAR_P(curr->name),
+                            content,
+                            contentlen);
 
-            xmlFree(XMLCHAR_P(pczContent));
-        }
-
+      xmlFree(XMLCHAR_P(content));
     }
 
-  return pEntry;
+  }
+
+  return location;
 }
 
 /**
  * Processes the passed-in node to generate a LocationInfo entry
  *
- * @param pEntry Pointer to the pointer to the ForecastInfo entry being filled.
- * @param pNode Pointer to the XML Item Node.
+ * @param forecast Pointer to the pointer to the ForecastInfo entry being filled.
+ * @param node     Pointer to the XML Item Node.
  *
  * @return 0 on success, -1 on failure
  */
 static gint
-processItemNode(gpointer * pEntry, xmlNodePtr pNode)
+item_node_process(gpointer * forecast, xmlNodePtr node)
 {
-  if (!pNode || !pEntry)
-    {
-      return -1;
-    }
+  if (!node || !forecast) {
+    return -1;
+  }
 
-  ForecastInfo * pInfo = *((ForecastInfo **)pEntry);
+  ForecastInfo * info = *((ForecastInfo **)forecast);
 
-  xmlNodePtr pCurr = pNode->xmlChildrenNode;
+  xmlNodePtr curr = node->xmlChildrenNode;
 
-  int iForecastCount = 0;
+  int forecastcnt = 0;
 
-  for (; pCurr != NULL; pCurr = pCurr->next)
-    {
-      if (pCurr->type == XML_ELEMENT_NODE)
-        {
-          if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("condition")))
-            {
-              const char * pczDate = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("date")));
-              const char * pczTemp = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("temp")));
-              const char * pczText = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("text")));
+  for (; curr != NULL; curr = curr->next){
+    if (curr->type == XML_ELEMENT_NODE) {
+      if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("condition"))) {
+        const char * date = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("date")));
+        const char * temp = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("temp")));
+        const char * text = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("text")));
 
-              gsize dateLength = ((pczDate)?strlen(pczDate):0);
-              gsize textLength = ((pczText)?strlen(pczText):0);
+        gsize datelen = ((date)?strlen(date):0);
+        gsize textlen = ((text)?strlen(text):0);
 
-              setStringIfDifferent(&pInfo->pcTime_, pczDate, dateLength);
+        string_if_different_set(&(info->time_),       date, datelen);
+        string_if_different_set(&(info->conditions_), text, textlen);
 
-              setIntIfDifferent(&pInfo->iTemperature_, pczTemp);
+        int_if_different_set(&(info->temperature_), temp);
 
-              setStringIfDifferent(&pInfo->pcConditions_, pczText, textLength);
-
-              xmlFree(XMLCHAR_P(pczDate));
-              xmlFree(XMLCHAR_P(pczTemp));
-              xmlFree(XMLCHAR_P(pczText));
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("description")))
-            {
-              char * pcContent = CHAR_P(xmlNodeListGetString(pCurr->doc, 
-                                                             pCurr->xmlChildrenNode, 
-                                                             1));
+        xmlFree(XMLCHAR_P(date));
+        xmlFree(XMLCHAR_P(temp));
+        xmlFree(XMLCHAR_P(text));
+      } else if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("description"))) {
+        char * content = CHAR_P(xmlNodeListGetString(curr->doc,
+                                                     curr->xmlChildrenNode, 
+                                                     1));
           
-              char * pcSavePtr = NULL;
+        char * saveptr = NULL;
 
-              // initial call to find the first '"'
-              strtok_r(pcContent, "\"", &pcSavePtr);
+        // need to skip quotes ("), both of them
+        strtok_r(content, "\"", &saveptr);
+        char * url = strtok_r(NULL, "\"", &saveptr);
 
-              // second call to find the second '"'
-              char * pcImageURL = strtok_r(NULL, "\"", &pcSavePtr);
+        // found the image
+        if (url && strstr(url, "yimg.com")) {
+          LXW_LOG(LXW_DEBUG, "yahooutil::item_node_process(): IMG URL: %s",
+                  url);
 
-              // found the image
-              if (pcImageURL && strstr(pcImageURL, "yimg.com"))
-                {
-                  LXW_LOG(LXW_DEBUG, "yahooutil::processItemNode(): IMG URL: %s",
-                          pcImageURL);
-
-                  setImageIfDifferent(&pInfo->pcImageURL_, 
-                                      &pInfo->pImage_,
-                                      pcImageURL, 
-                                      strlen(pcImageURL));
-                }
-                  
-              xmlFree(XMLCHAR_P(pcContent));
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("forecast")))
-            {
-              ++iForecastCount;
-
-              const char * pczDay = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("day")));
-              const char * pczHigh = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("high")));
-              const char * pczLow = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("low")));
-              const char * pczText = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("text")));
-
-              gsize dayLength = ((pczDay)?strlen(pczDay):0);
-              gsize textLength = ((pczText)?strlen(pczText):0);
-
-              if (iForecastCount == 1)
-                {
-                  setStringIfDifferent(&pInfo->today_.pcDay_, pczDay, dayLength);
-
-                  setIntIfDifferent(&pInfo->today_.iHigh_, pczHigh);
-
-                  setIntIfDifferent(&pInfo->today_.iLow_, pczLow);
-
-                  setStringIfDifferent(&pInfo->today_.pcConditions_, pczText, textLength);
-                }
-              else
-                {
-                  setStringIfDifferent(&pInfo->tomorrow_.pcDay_, pczDay, dayLength);
-
-                  setIntIfDifferent(&pInfo->tomorrow_.iHigh_, pczHigh);
-
-                  setIntIfDifferent(&pInfo->tomorrow_.iLow_, pczLow);
-
-                  setStringIfDifferent(&pInfo->tomorrow_.pcConditions_, pczText, textLength);
-                }
-
-              xmlFree(XMLCHAR_P(pczDay));
-              xmlFree(XMLCHAR_P(pczHigh));
-              xmlFree(XMLCHAR_P(pczLow));
-              xmlFree(XMLCHAR_P(pczText));
-            }
-
+          image_if_different_set(&info->imageURL_, 
+                                 &info->image_,
+                                 url, 
+                                 strlen(url));
         }
+                  
+        xmlFree(XMLCHAR_P(content));
+      } else if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("forecast"))) {
+        const char * day  = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("day")));
+        const char * high = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("high")));
+        const char * low  = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("low")));
+        const char * text = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("text")));
+        const char * code = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("code")));
+
+        gsize daylen  = ((day)?strlen(day):0);
+        gsize textlen = ((text)?strlen(text):0);
+
+        string_if_different_set(&(info->days_[forecastcnt].day_),        day,  daylen);
+        string_if_different_set(&(info->days_[forecastcnt].conditions_), text, textlen);
+
+        int_if_different_set(&(info->days_[forecastcnt].high_), high);
+        int_if_different_set(&(info->days_[forecastcnt].low_),  low);
+        int_if_different_set(&(info->days_[forecastcnt].code_), code);
+
+        forecastcnt++;
+
+        xmlFree(XMLCHAR_P(day));
+        xmlFree(XMLCHAR_P(high));
+        xmlFree(XMLCHAR_P(low));
+        xmlFree(XMLCHAR_P(text));
+        xmlFree(XMLCHAR_P(code));
+
+        if (forecastcnt >= FORECAST_MAX_DAYS) {
+          /* just to be on the safe side... */
+          break;
+        }
+      }
 
     }
+
+  }
 
   return 0;
 }
@@ -510,384 +434,426 @@ processItemNode(gpointer * pEntry, xmlNodePtr pNode)
 /**
  * Processes the passed-in node to generate a ForecastInfo entry
  *
- * @param pNode Pointer to the XML Channel Node.
- * @param pEntry Pointer to the ForecastInfo entry to be filled in.
+ * @param node     Pointer to the XML Channel Node.
+ * @param forecast Pointer to the ForecastInfo entry to be filled in.
  *
  * @return A newly created ForecastInfo entry on success, or NULL on failure.
  */
 static gpointer
-processChannelNode(xmlNodePtr pNode, ForecastInfo * pEntry)
+channel_node_process(xmlNodePtr node, ForecastInfo * forecast)
 {
-  if (!pNode)
-    {
-      return NULL;
-    }
+  if (!node) {
+    return NULL;
+  }
 
-  xmlNodePtr pCurr = pNode->xmlChildrenNode;
+  xmlNodePtr curr = node->xmlChildrenNode;
 
-  for (; pCurr != NULL; pCurr = pCurr->next)
-    {
-      if (pCurr->type == XML_ELEMENT_NODE)
-        {
-          if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("title")))
-            {
-              /* Evaluate title to see if there was an error */
-              char * pcContent = CHAR_P(xmlNodeListGetString(pCurr->doc, 
-                                                             pCurr->xmlChildrenNode, 
-                                                             1));
+  for (; curr != NULL; curr = curr->next) {
+    if (curr->type == XML_ELEMENT_NODE) {
+      if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("title"))) {
+        /* Evaluate title to see if there was an error */
+        char * content = CHAR_P(xmlNodeListGetString(curr->doc, 
+                                                     curr->xmlChildrenNode, 
+                                                     1));
               
-              if (strstr(pcContent, "Error"))
-                {
-                  xmlFree(XMLCHAR_P(pcContent));
+        if (strstr(content, "Error")) {
+          xmlFree(XMLCHAR_P(content));
                   
-                  do
-                    {
-                      pCurr = pCurr->next;
-                    } while (pCurr && !xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("item")));
+          do {
+            curr = curr->next;
+          } while (curr && !xmlStrEqual(curr->name, CONSTXMLCHAR_P("item")));
 
-                  xmlNodePtr pChild = (pCurr)?pCurr->xmlChildrenNode:NULL;
+          xmlNodePtr child = (curr)?curr->xmlChildrenNode:NULL;
                   
-                  for (; pChild != NULL; pChild = pChild->next)
-                    {
-                      if (pChild->type == XML_ELEMENT_NODE && 
-                          xmlStrEqual(pChild->name, CONSTXMLCHAR_P("title")))
-                        {
-                          pcContent = CHAR_P(xmlNodeListGetString(pChild->doc, 
-                                                                  pChild->xmlChildrenNode, 
-                                                                  1));
+          for (; child != NULL; child = child->next) {
+            if (child->type == XML_ELEMENT_NODE && 
+                xmlStrEqual(child->name, CONSTXMLCHAR_P("title"))) {
+              content = CHAR_P(xmlNodeListGetString(child->doc, 
+                                                    child->xmlChildrenNode, 
+                                                    1));
 
-                          LXW_LOG(LXW_ERROR, "yahooutil::processChannelNode(): Forecast retrieval error: %s",
-                                  pcContent);
+              LXW_LOG(LXW_ERROR,
+                      "yahooutil::channel_node_process(): Forecast retrieval error: %s",
+                      content);
 
-
-                          xmlFree(XMLCHAR_P(pcContent));
-                        }
-                    }
-
-                  return NULL;
-                }
-              else
-                {
-                  xmlFree(XMLCHAR_P(pcContent));
-                  /* ...and continue... */
-                }
-
+              xmlFree(XMLCHAR_P(content));
             }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("item")))
-            {
-              /* item child element gets 'special' treatment */
-              processItemNode((gpointer *)&pEntry, pCurr);
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("units")))
-            {
-              // distance
-              const char * pczDistance = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("distance")));
+          }
 
-              gsize distanceLength = ((pczDistance)?strlen(pczDistance):0);
-
-              setStringIfDifferent(&pEntry->units_.pcDistance_, pczDistance, distanceLength);
-
-              xmlFree(XMLCHAR_P(pczDistance));
-
-              // pressure
-              const char * pczPressure = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("pressure")));
-
-              gsize pressureLength = ((pczPressure)?strlen(pczPressure):0);
-
-              setStringIfDifferent(&pEntry->units_.pcPressure_, pczPressure, pressureLength);
-
-              xmlFree(XMLCHAR_P(pczPressure));
-
-              // speed
-              const char * pczSpeed = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("speed")));
-
-              gsize speedLength = ((pczSpeed)?strlen(pczSpeed):0);
-
-              setStringIfDifferent(&pEntry->units_.pcSpeed_, pczSpeed, speedLength);
-
-              xmlFree(XMLCHAR_P(pczSpeed));
-
-              // temperature
-              const char * pczTemperature = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("temperature")));
-
-              gsize temperatureLength = ((pczTemperature)?strlen(pczTemperature):0);
-
-              setStringIfDifferent(&pEntry->units_.pcTemperature_, pczTemperature, temperatureLength);
-
-              xmlFree(XMLCHAR_P(pczTemperature));
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("wind")))
-            {
-              // chill
-              const char * pczChill = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("chill")));
-
-              setIntIfDifferent(&pEntry->iWindChill_, pczChill);
-
-              xmlFree(XMLCHAR_P(pczChill));
-
-              // direction
-              const char * pczDirection = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("direction")));
-
-              gint iValue = (gint)g_ascii_strtoll((pczDirection)?pczDirection:"999", NULL, 10);
-
-              const gchar * pczDir = WIND_DIRECTION(iValue);
-
-              setStringIfDifferent(&pEntry->pcWindDirection_, pczDir, strlen(pczDir));
-
-              xmlFree(XMLCHAR_P(pczDirection));
-
-              // speed
-              const char * pczSpeed = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("speed")));
-
-              setIntIfDifferent(&pEntry->iWindSpeed_, pczSpeed);
-
-              xmlFree(XMLCHAR_P(pczSpeed));
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("atmosphere")))
-            {
-              // humidity
-              const char * pczHumidity = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("humidity")));
-
-              setIntIfDifferent(&pEntry->iHumidity_, pczHumidity);
-
-              xmlFree(XMLCHAR_P(pczHumidity));
-
-              // pressure
-              const char * pczPressure = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("pressure")));
-
-              pEntry->dPressure_ = g_ascii_strtod((pczPressure)?pczPressure:"0", NULL);
-
-              xmlFree(XMLCHAR_P(pczPressure));
-
-              // visibility
-              const char * pczVisibility = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("visibility")));
-
-              pEntry->dVisibility_ = g_ascii_strtod((pczVisibility)?pczVisibility:"0", NULL);
-
-              // need to divide by 100
-              //pEntry->dVisibility_ = pEntry->dVisibility_/100;
-
-              xmlFree(XMLCHAR_P(pczVisibility));
-
-              // state
-              const char * pczState = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("rising")));
-                            
-              pEntry->pressureState_ = (PressureState)g_ascii_strtoll((pczState)?pczState:"0", NULL, 10);
-
-              xmlFree(XMLCHAR_P(pczState));
-            }
-          else if (xmlStrEqual(pCurr->name, CONSTXMLCHAR_P("astronomy")))
-            {
-              // sunrise
-              const char * pczSunrise = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("sunrise")));
-
-              gsize sunriseLength = ((pczSunrise)?strlen(pczSunrise):0);
-
-              setStringIfDifferent(&pEntry->pcSunrise_, pczSunrise, sunriseLength);
-
-              xmlFree(XMLCHAR_P(pczSunrise));
-
-              // sunset
-              const char * pczSunset = CONSTCHAR_P(xmlGetProp(pCurr, XMLCHAR_P("sunset")));
-
-              gsize sunsetLength = ((pczSunset)?strlen(pczSunset):0);
-
-              setStringIfDifferent(&pEntry->pcSunset_, pczSunset, sunsetLength);
-
-              xmlFree(XMLCHAR_P(pczSunset));
-            }
-          
+          return NULL;
         }
+        
+        xmlFree(XMLCHAR_P(content));
+      } else if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("item"))) {
+        /* item child element gets 'special' treatment */
+        item_node_process((gpointer *)&forecast, curr);
+      } else if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("units"))) {
+        // distance
+        const char * distance = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("distance")));
 
+        gsize distancelen = ((distance)?strlen(distance):0);
+
+        string_if_different_set(&forecast->units_.distance_, distance, distancelen);
+
+        xmlFree(XMLCHAR_P(distance));
+
+        // pressure
+        const char * pressure = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("pressure")));
+
+        gsize pressurelen = ((pressure)?strlen(pressure):0);
+
+        string_if_different_set(&forecast->units_.pressure_, pressure, pressurelen);
+
+        xmlFree(XMLCHAR_P(pressure));
+
+        // speed
+        const char * speed = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("speed")));
+
+        gsize speedlen = ((speed)?strlen(speed):0);
+
+        string_if_different_set(&forecast->units_.speed_, speed, speedlen);
+
+        xmlFree(XMLCHAR_P(speed));
+
+        // temperature
+        const char * temperature = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("temperature")));
+
+        gsize temperaturelen = ((temperature)?strlen(temperature):0);
+
+        string_if_different_set(&forecast->units_.temperature_, temperature, temperaturelen);
+
+        xmlFree(XMLCHAR_P(temperature));
+      } else if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("wind"))) {
+        // chill
+        const char * chill = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("chill")));
+
+        int_if_different_set(&forecast->windChill_, chill);
+
+        xmlFree(XMLCHAR_P(chill));
+
+        // direction
+        const char * direction = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("direction")));
+
+        gint value = (gint)g_ascii_strtoll((direction)?direction:"999", NULL, 10);
+
+        const gchar * dirvalue = WIND_DIRECTION(value);
+
+        string_if_different_set(&forecast->windDirection_, dirvalue, strlen(dirvalue));
+
+        xmlFree(XMLCHAR_P(direction));
+
+        // speed
+        const char * speed = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("speed")));
+
+        int_if_different_set(&forecast->windSpeed_, speed);
+
+        xmlFree(XMLCHAR_P(speed));
+      } else if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("atmosphere"))) {
+        // humidity
+        const char * humidity = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("humidity")));
+
+        int_if_different_set(&forecast->humidity_, humidity);
+
+        xmlFree(XMLCHAR_P(humidity));
+
+        // pressure
+        const char * pressure = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("pressure")));
+
+        forecast->pressure_ = g_ascii_strtod((pressure)?pressure:"0", NULL);
+
+        xmlFree(XMLCHAR_P(pressure));
+
+        // visibility
+        const char * visibility = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("visibility")));
+
+        forecast->visibility_ = g_ascii_strtod((visibility)?visibility:"0", NULL);
+
+        // need to divide by 100
+        //forecast->dVisibility_ = forecast->dVisibility_/100;
+
+        xmlFree(XMLCHAR_P(visibility));
+
+        // state
+        const char * state = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("rising")));
+                            
+        forecast->pressureState_ = (PressureState) g_ascii_strtoll((state)?state:"0",
+                                                                   NULL,
+                                                                   10);
+
+        xmlFree(XMLCHAR_P(state));
+      } else if (xmlStrEqual(curr->name, CONSTXMLCHAR_P("astronomy"))) {
+        // sunrise
+        const char * sunrise = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("sunrise")));
+
+        gsize sunriselen = ((sunrise)?strlen(sunrise):0);
+
+        string_if_different_set(&forecast->sunrise_, sunrise, sunriselen);
+
+        xmlFree(XMLCHAR_P(sunrise));
+
+        // sunset
+        const char * sunset = CONSTCHAR_P(xmlGetProp(curr, XMLCHAR_P("sunset")));
+
+        gsize sunsetlen = ((sunset)?strlen(sunset):0);
+
+        string_if_different_set(&forecast->sunset_, sunset, sunsetlen);
+
+        xmlFree(XMLCHAR_P(sunset));
+      }
+          
     }
 
-  return pEntry;
+  }
+
+  return forecast;
 }
 
 /**
  * Evaluates an XPath expression on the passed-in context.
  *
- * @param pContext Pointer to the context.
- * @param pczExpression The XPath expression to evaluate
+ * @param ctxt Pointer to the context.
+ * @param expr The XPath expression to evaluate
  *
  * @return xmlNodeSetPtr pointing to the resulting node set, must be
  *         freed by the caller.
  */
 static xmlNodeSetPtr
-evaluateXPathExpression(xmlXPathContextPtr pContext, const char * pczExpression)
+xpath_evaluate(xmlXPathContextPtr ctxt, const char * expr)
 {
-  xmlXPathObjectPtr pObject = xmlXPathEval(CONSTXMLCHAR_P(pczExpression), 
-                                           pContext);
+  xmlXPathObjectPtr pObject = xmlXPathEval(CONSTXMLCHAR_P(expr), ctxt);
 
-  if (!pObject || !pObject->nodesetval)
-    {
-      return NULL;
-    }
+  if (!pObject || !pObject->nodesetval) {
+    return NULL;
+  }
 
-  xmlNodeSetPtr pNodeSet = pObject->nodesetval;
+  xmlNodeSetPtr nodeset = pObject->nodesetval;
 
   xmlXPathFreeNodeSetList(pObject);
 
-  return pNodeSet;
+  return nodeset;
 }
 
 /**
- * Parses the response and fills in the supplied list with entries (if any)
+ * Parses the location response and fills in the supplied list with entries
+ * (if any).
  *
- * @param pResponse Pointer to the response received.
- * @param pList Pointer to the pointer to the list to populate.
- * @param pForecast Pointer to the pointer to the forecast to retrieve.
+ * @param response Pointer to the response received.
+ * @param list     Pointer to the pointer to the list to populate.
  *
  * @return 0 on success, -1 on failure
  *
- * @note If the pList pointer is NULL or the pForecast pointer is NULL,
- *       nothing is done and failure is returned. Otherwise, the appropriate
- *       pointer is set based on the name of the XML element:
- *       'Result' for GList (pList)
- *       'channel' for Forecast (pForecast)
+ * @note If the list pointer is NULL nothing is done and failure is
+ *       returned. Otherwise, the appropriate pointer is set based on the name
+ *       of the XML element: 'Result' for GList (list)
  */
 static gint
-parseResponse(gpointer pResponse, GList ** pList, gpointer * pForecast)
+location_response_parse(gpointer response, GList ** list)
 {
-  int iLocation = (pList)?1:0;
-
-  xmlDocPtr pDoc = xmlReadMemory(CONSTCHAR_P(pResponse),
-                                 strlen(pResponse),
+  xmlDocPtr pDoc = xmlReadMemory(CONSTCHAR_P(response),
+                                 strlen(response),
                                  "",
                                  NULL,
                                  0);
 
-  if (!pDoc)
-    {
-      // failed
-      LXW_LOG(LXW_ERROR, "yahooutil::parseResponse(): Failed to parse response %s",
-              CONSTCHAR_P(pResponse));
+  if (!pDoc) {
+    // failed
+    LXW_LOG(LXW_ERROR,
+            "yahooutil::location_response_parse(): Failed to parse response %s",
+            CONSTCHAR_P(response));
 
-      return -1;
-    }
+    return -1;
+  }
 
-  xmlNodePtr pRoot = xmlDocGetRootElement(pDoc);
+  xmlNodePtr root = xmlDocGetRootElement(pDoc);
   
   // the second part of the if can be broken out
-  if (!pRoot || !xmlStrEqual(pRoot->name, CONSTXMLCHAR_P("query")))
-    {
-      // failed
-      LXW_LOG(LXW_ERROR, "yahooutil::parseResponse(): Failed to retrieve root %s",
-              CONSTCHAR_P(pResponse));
+  if (!root || !xmlStrEqual(root->name, CONSTXMLCHAR_P("query"))) {
+    // failed
+    LXW_LOG(LXW_ERROR,
+            "yahooutil::location_response_parse(): Failed to retrieve root %s",
+            CONSTCHAR_P(response));
 
-      xmlFreeDoc(pDoc);
+    xmlFreeDoc(pDoc);
 
-      return -1;
-    }
+    return -1;
+  }
 
   // use xpath to find /query/results/Result
   xmlXPathInit();
 
-  xmlXPathContextPtr pXCtxt = xmlXPathNewContext(pDoc);
+  xmlXPathContextPtr pCtxt = xmlXPathNewContext(pDoc);
 
-  const char * pczExpression = "/query/results/channel";
-
-  if (iLocation)
-    {
-      pczExpression = "/query/results/Result";
-    }
+  const char * expr = "/query/results/Result";
 
   // have some results...
-  xmlNodeSetPtr pNodeSet = evaluateXPathExpression(pXCtxt, pczExpression);
+  xmlNodeSetPtr nodeset = xpath_evaluate(pCtxt, expr);
 
-  if (!pNodeSet)
-    {
-      // error, or no results found -- failed
-      xmlXPathFreeContext(pXCtxt);
+  if (!nodeset) {
+    xmlXPathFreeContext(pCtxt);
 
-      xmlFreeDoc(pDoc);
+    xmlFreeDoc(pDoc);
 
-      return -1;
-    }
+    return -1;
+  }
 
-  int iCount = 0;
-  int iSize = pNodeSet->nodeNr;
+  int nodecnt   = 0;
+  int nodetotal = nodeset->nodeNr;
 
-  gint iRetVal = 0;
+  gint retval = 0;
 
-  for (; iCount < iSize; ++iCount)
-    {
-      if (pNodeSet->nodeTab)
-        {
-          xmlNodePtr pNode = pNodeSet->nodeTab[iCount];
+  for (; nodecnt < nodetotal; ++nodecnt) {
+    if (nodeset->nodeTab) {
+      xmlNodePtr node = nodeset->nodeTab[nodecnt];
 
-          if (pNode && pNode->type == XML_ELEMENT_NODE)
-            {
-              if (xmlStrEqual(pNode->name, CONSTXMLCHAR_P("Result")))
-                {
-                  gpointer pEntry = processResultNode(pNode);
+      if (node && node->type == XML_ELEMENT_NODE) {
+        if (xmlStrEqual(node->name, CONSTXMLCHAR_P("Result"))) {
+          gpointer entry = result_node_process(node);
                   
-                  if (pEntry && pList)
-                    {
-                      *pList = g_list_prepend(*pList, pEntry);
-                    }
-                }
-              else if (xmlStrEqual(pNode->name, CONSTXMLCHAR_P("channel")))
-                {
-                  ForecastInfo * pEntry = NULL;
-                  
-                  gboolean bNewed = FALSE;
+          if (entry && list) {
+            *list = g_list_prepend(*list, entry);
+          }
+        }
 
-                  /* Check if forecast is allocated, if not, 
-                   * allocate and populate 
-                   */
-                  if (pForecast)
-                    {
-                      if (*pForecast)
-                        {
-                          pEntry = (ForecastInfo *)*pForecast;
-                        }
-                      else
-                        {
-                          pEntry = (ForecastInfo *)g_try_new0(ForecastInfo, 1);
+      } // end if element
 
-                          bNewed = TRUE;
-                        }
-                  
-                      if (!pEntry)
-                        {
-                          iRetVal = -1;
-                        }
-                      else
-                        {
-                          *pForecast = processChannelNode(pNode, pEntry);
-                          
-                          if (!*pForecast)
-                            {
-                              /* Failed, forecast is freed by caller */
-                              
-                              /* Unless it was just newed... */
-                              if (bNewed)
-                                {
-                                  g_free(pEntry);
-                                }
-                          
-                              iRetVal = -1;
-                            }
-                        }
+    } // end if nodeTab
 
-                    }// end else if pForecast
+  } // end for noteTab size
 
-                }// end else if 'channel'
+  xmlXPathFreeNodeSet(nodeset);
 
-            }// end if element
-
-        }// end if nodeTab
-
-    }// end for noteTab size
-
-  xmlXPathFreeNodeSet(pNodeSet);
-
-  xmlXPathFreeContext(pXCtxt);
+  xmlXPathFreeContext(pCtxt);
 
   xmlFreeDoc(pDoc);
 
-  return iRetVal;
+  return retval;
+}
+
+/**
+ * Parses the response and fills in the supplied forecast pointer.
+ *
+ * @param response Pointer to the response received.
+ * @param forecast Pointer to the pointer to the forecast to retrieve.
+ *
+ * @return 0 on success, -1 on failure
+ *
+ * @note If the the forecast pointer is NULL, nothing is done and failure is
+ *       returned. Otherwise, the appropriate pointer is set based on the name
+ *       of the XML element: 'channel' for Forecast (forecast)
+ */
+//static gint
+gint
+forecast_response_parse(gpointer response, gpointer * forecast)
+{
+  xmlDocPtr pDoc = xmlReadMemory(CONSTCHAR_P(response),
+                                 strlen(response),
+                                 "",
+                                 NULL,
+                                 0);
+
+  if (!pDoc) {
+    // failed
+    LXW_LOG(LXW_ERROR,
+            "yahooutil::forecast_response_parse(): Failed to parse response %s",
+            CONSTCHAR_P(response));
+
+    return -1;
+  }
+
+  xmlNodePtr root = xmlDocGetRootElement(pDoc);
+  
+  // the second part of the if can be broken out
+  if (!root || !xmlStrEqual(root->name, CONSTXMLCHAR_P("query"))) {
+    // failed
+    LXW_LOG(LXW_ERROR,
+            "yahooutil::forecast_response_parse(): Failed to retrieve root %s",
+            CONSTCHAR_P(response));
+
+    xmlFreeDoc(pDoc);
+
+    return -1;
+  }
+
+  // use xpath to find /query/results/Result
+  xmlXPathInit();
+
+  xmlXPathContextPtr pCtxt = xmlXPathNewContext(pDoc);
+
+  const char * expr = "/query/results/channel";
+
+  // have some results...
+  xmlNodeSetPtr nodeset = xpath_evaluate(pCtxt, expr);
+
+  if (!nodeset) {
+    // error, or no results found -- failed
+    xmlXPathFreeContext(pCtxt);
+
+    xmlFreeDoc(pDoc);
+
+    return -1;
+  }
+
+  int nodecnt   = 0;
+  int nodetotal = nodeset->nodeNr;
+
+  gint retval = 0;
+
+  for (; nodecnt < nodetotal; ++nodecnt) {
+    if (nodeset->nodeTab) {
+      xmlNodePtr node = nodeset->nodeTab[nodecnt];
+
+      if (node && node->type == XML_ELEMENT_NODE) {
+        if (xmlStrEqual(node->name, CONSTXMLCHAR_P("channel"))) {
+          ForecastInfo * entry = NULL;
+                  
+          gboolean newed = FALSE;
+
+          /* Check if forecast is allocated, if not, 
+           * allocate and populate 
+           */
+          if (forecast) {
+            if (*forecast) {
+              entry = (ForecastInfo *)*forecast;
+            } else {
+              entry = (ForecastInfo *)g_try_new0(ForecastInfo, 1);
+
+              newed = TRUE;
+            }
+                  
+            if (!entry) {
+              retval = -1;
+            } else {
+              *forecast = channel_node_process(node, entry);
+                          
+              if (!*forecast) {
+                /* Failed, forecast is freed by caller */
+                              
+                /* Unless it was just newed... */
+                if (newed) {
+                  g_free(entry);
+                }
+                          
+                retval = -1;
+              }
+            }
+
+          } // end if forecast
+
+        } // end else if 'channel'
+
+      } // end if element
+
+    } // end if nodeTab
+
+  } // end for noteTab size
+
+  xmlXPathFreeNodeSet(nodeset);
+
+  xmlXPathFreeContext(pCtxt);
+
+  xmlFreeDoc(pDoc);
+
+  return retval;
 }
 
 /**
@@ -895,14 +861,13 @@ parseResponse(gpointer pResponse, GList ** pList, gpointer * pForecast)
  *
  */
 void
-initializeYahooUtil(void)
+yahooutil_init(void)
 {
-  if (!g_iInitialized)
-    {
-      xmlInitParser();
+  if (!g_initialized) {
+    xmlInitParser();
 
-      g_iInitialized = 1;
-    }
+    g_initialized = 1;
+  }
 }
 
 /**
@@ -910,132 +875,123 @@ initializeYahooUtil(void)
  *
  */
 void
-cleanupYahooUtil(void)
+yahooutil_cleanup(void)
 {
-  if (g_iInitialized)
-    {
-      xmlCleanupParser();
+  if (g_initialized) {
+    xmlCleanupParser();
 
-      g_iInitialized = 0;
-    }
+    g_initialized = 0;
+  }
 }
 
 /**
  * Retrieves the details for the specified location
  *
- * @param pczLocation The string containing the name/code of the location
+ * @param location The string containing the name/code of the location
  *
  * @return A pointer to a list of LocationInfo entries, possibly empty, 
  *         if no details were found. Caller is responsible for freeing the list.
  */
 GList *
-getLocationInfo(const gchar * pczLocation)
+yahooutil_location_find(const gchar * location)
 {
-  gint iRetCode = 0;
-  gint iDataSize = 0;
+  gint rc = 0;
+  gint datalen = 0;
 
-  GList * pList = NULL;
+  GList * list = NULL;
 
-  gchar * pcEscapedLocation = convertToASCII(pczLocation); 
+  gchar * locationascii = locale_to_ascii(location);
 
-  gsize len = getWOEIDQueryLength(pcEscapedLocation);
+  gsize len = WOEID_QUERY_LEN + strlen(locationascii);
 
-  gchar * cQueryBuffer = g_malloc0(len);
+  gchar * querybuf = g_malloc0(len);
 
-  gint iRet = getWOEIDQuery(cQueryBuffer, pcEscapedLocation);
+  gint ret = woeid_query_gen(querybuf, locationascii);
 
-  g_free(pcEscapedLocation);
+  g_free(locationascii);
 
-  LXW_LOG(LXW_DEBUG, "yahooutil::getLocationInfo(%s): query[%d]: %s",
-          pczLocation, iRet, cQueryBuffer);
+  LXW_LOG(LXW_DEBUG, "yahooutil::yahooutil_find_location(%s): query[%d]: %s",
+          location, ret, querybuf);
 
-  gpointer pResponse = getURL(cQueryBuffer, &iRetCode, &iDataSize);
+  gpointer response = httputil_url_get(querybuf, &rc, &datalen);
 
-  if (!pResponse || iRetCode != HTTP_STATUS_OK)
-    {
-      LXW_LOG(LXW_ERROR, "yahooutil::getLocationInfo(%s): Failed with error code %d",
-              pczLocation, iRetCode);
-    }
-  else
-    {
-      LXW_LOG(LXW_DEBUG, "yahooutil::getLocationInfo(%s): Response code: %d, size: %d",
-              pczLocation, iRetCode, iDataSize);
+  if (!response || rc != HTTP_STATUS_OK) {
+    LXW_LOG(LXW_ERROR, "yahooutil::yahooutil_find_location(%s): Failed with error code %d",
+            location, rc);
+  } else {
+    LXW_LOG(LXW_DEBUG, "yahooutil::yahooutil_find_location(%s): Response code: %d, size: %d",
+            location, rc, datalen);
 
-      LXW_LOG(LXW_VERBOSE, "yahooutil::getLocation(%s): Contents: %s", 
-              pczLocation, (const char *)pResponse);
+    LXW_LOG(LXW_VERBOSE, "yahooutil::getLocation(%s): Contents: %s", 
+            location, (const char *)response);
 
-      iRet = parseResponse(pResponse, &pList, NULL);
+    ret = location_response_parse(response, &list);
       
-      LXW_LOG(LXW_DEBUG, "yahooutil::getLocation(%s): Response parsing returned %d",
-              pczLocation, iRet);
+    LXW_LOG(LXW_DEBUG, "yahooutil::getLocation(%s): Response parsing returned %d",
+            location, ret);
 
-      if (iRet)
-        {
-          // failure
-          g_list_free_full(pList, freeLocation);
-        }
-
+    if (ret) {
+      // failure
+      g_list_free_full(list, location_free);
     }
+  }
 
-  g_free(cQueryBuffer);
-  g_free(pResponse);
+  g_free(querybuf);
+  g_free(response);
 
-  return pList;
+  return list;
 }
 
 /**
  * Retrieves the forecast for the specified location WOEID
  *
- * @param pczWOEID The string containing the WOEID of the location
- * @param czUnits The character containing the units for the forecast (c|f)
- * @param pForecast The pointer to the forecast to be filled. If set to NULL,
+ * @param woeid    The string containing the WOEID of the location
+ * @param units    The character containing the units for the forecast (c|f)
+ * @param forecast The pointer to the forecast to be filled. If set to NULL,
  *                  a new one will be allocated.
  *
  */
 void
-getForecastInfo(const gchar * pczWOEID, const gchar czUnits, gpointer * pForecast)
+yahooutil_forecast_get(const gchar * woeid, const gchar units, gpointer * forecast)
 {
-  gint iRetCode = 0;
-  gint iDataSize = 0;
+  gint rc = 0;
+  gint datalen = 0;
 
-  gsize len = getForecastQueryLength(pczWOEID);
+  gsize len = FORECAST_QUERY_LEN + strlen(woeid);
 
-  gchar * cQueryBuffer = g_malloc0(len);
+  gchar * querybuf = g_malloc0(len);
 
-  gint iRet = getForecastQuery(cQueryBuffer, pczWOEID, czUnits);
+  gint ret = forecast_query_gen(querybuf, woeid, units);
 
-  LXW_LOG(LXW_DEBUG, "yahooutil::getForecastInfo(%s): query[%d]: %s",
-          pczWOEID, iRet, cQueryBuffer);
+  LXW_LOG(LXW_DEBUG, "yahooutil::yahooutil_forecast_get(%s): query[%d]: %s",
+          woeid, ret, querybuf);
 
-  gpointer pResponse = getURL(cQueryBuffer, &iRetCode, &iDataSize);
+  gpointer response = httputil_url_get(querybuf, &rc, &datalen);
 
-  if (!pResponse || iRetCode != HTTP_STATUS_OK)
-    {
-      LXW_LOG(LXW_ERROR, "yahooutil::getForecastInfo(%s): Failed with error code %d",
-              pczWOEID, iRetCode);
-    }
-  else
-    {
-      LXW_LOG(LXW_DEBUG, "yahooutil::getForecastInfo(%s): Response code: %d, size: %d",
-              pczWOEID, iRetCode, iDataSize);
-
-      LXW_LOG(LXW_VERBOSE, "yahooutil::getForecastInfo(%s): Contents: %s",
-              pczWOEID, (const char *)pResponse);
-
-      iRet = parseResponse(pResponse, NULL, pForecast);
+  if (!response || rc != HTTP_STATUS_OK) {
+    LXW_LOG(LXW_ERROR, "yahooutil::yahooutil_forecast_get(%s): Failed with error code %d",
+            woeid, rc);
+  } else {
+    LXW_LOG(LXW_DEBUG, "yahooutil::yahooutil_forecast_get(%s): Response code: %d, size: %d",
+            woeid, rc, datalen);
     
-      LXW_LOG(LXW_DEBUG, "yahooutil::getForecastInfo(%s): Response parsing returned %d",
-              pczWOEID, iRet);
+    LXW_LOG(LXW_VERBOSE, "yahooutil::yahooutil_forecast_get(%s): Contents: %s",
+            woeid, (const char *)response);
+    
+    ret = forecast_response_parse(response, forecast);
+    
+    LXW_LOG(LXW_DEBUG,
+            "yahooutil::yahooutil_forecast_get(%s): Response parsing returned %d",
+            woeid, ret);
 
-      if (iRet)
-        {
-          freeForecast(*pForecast);
+    if (ret) {
+      forecast_free(*forecast);
 
-          *pForecast = NULL;
-        }
-
+      *forecast = NULL;
     }
 
-  g_free(cQueryBuffer);
-  g_free(pResponse);
+  }
+
+  g_free(querybuf);
+  g_free(response);
 }

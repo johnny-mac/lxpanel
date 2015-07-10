@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2012-2014 Piotr Sipika; see the AUTHORS file for more.
+ * Copyright (c) 2012-2015 Piotr Sipika; see the AUTHORS file for more.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -33,14 +33,14 @@
 /* LocationInfo struct definition */
 typedef struct 
 {
-  gchar * pcAlias_;
-  gchar * pcCity_;
-  gchar * pcState_;
-  gchar * pcCountry_;
-  gchar * pcWOEID_;
-  gchar cUnits_;
-  guint uiInterval_;
-  gboolean bEnabled_;
+  gchar *  alias_;
+  gchar *  city_;
+  gchar *  state_;
+  gchar *  country_;
+  gchar *  woeid_;
+  gchar    units_;
+  guint    interval_;
+  gboolean enabled_;
 } LocationInfo;
 
 /* Configuration helpers */
@@ -64,42 +64,46 @@ extern const gchar * LocationInfoFieldNames[];
  * Provides the mechanism to free any data associated with 
  * the LocationInfo structure
  *
- * @param pData Entry to free.
+ * @param location Location entry to free.
  *
  */
 void
-freeLocation(gpointer pData);
+location_free(gpointer location);
 
 /**
  * Prints the contents of the supplied entry to stdout
  *
- * @param pEntry Entry contents of which to print.
+ * @param locatrion Location entry contents of which to print.
  *
  */
 void
-printLocation(gpointer pEntry);
+location_print(gpointer location);
 
 /**
- * Sets the alias for the location
+ * Sets the given property for the location
  *
- * @param pEntry Pointer to the location to modify
- * @param pData Alias value to use
- *
+ * @param location Pointer to the location to modify.
+ * @param property Name of the property to set.
+ * @param value    Value to assign to the property.
+ * @param len      Length of the value to assign to the property (think strlen())
  */
 void
-setLocationAlias(gpointer pEntry, gpointer pData);
+location_property_set(gpointer      location,
+                      const gchar * property,
+                      const gchar * value,
+                      gsize         len);
 
 /**
  * Copies a location entry.
  *
- * @param pDestination Address of the pointer to the location to set.
- * @param pSource      Pointer to the location to use/copy.
+ * @param dst Address of the pointer to the location to set.
+ * @param src Pointer to the location to use/copy.
  *
  * @note Destination is first freed, if non-NULL, otherwise a new allocation
  *       is made. Both source and destination locations must be released by
  *       the caller.
  */
 void
-copyLocation(gpointer * pDestination, gpointer pSource);
+location_copy(gpointer * dst, gpointer src);
 
 #endif

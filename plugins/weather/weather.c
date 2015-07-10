@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2012-2014 Piotr Sipika; see the AUTHORS file for more.
+ * Copyright (c) 2012-2015 Piotr Sipika; see the AUTHORS file for more.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -18,8 +18,6 @@
  * See the COPYRIGHT file for more information.
  */
 
-#ifndef USE_STANDALONE
-
 #include "location.h"
 #include "weatherwidget.h"
 #include "yahooutil.h"
@@ -33,293 +31,271 @@
 #include <stdlib.h>
 
 /* Need to maintain count for bookkeeping */
-static gint g_iCount = 0;
+static gint g_instancecnt = 0;
 
 typedef struct
 {
-  gint iMyId_;
-  GtkWidget *pWeather_;
-  config_setting_t *pConfig_;
-  LXPanel *pPanel_;
+  gint               myid_;
+  GtkWidget        * weather_;
+  config_setting_t * config_;
+  LXPanel          * panel_;
 } WeatherPluginPrivate;
 
 
 /**
  * Weather Plugin destructor.
  *
- * @param pData Pointer to the plugin data (private).
+ * @param data Pointer to the plugin data (private).
  */
 static void
-weather_destructor(gpointer pData)
+weather_destructor(gpointer data)
 {
-  WeatherPluginPrivate * pPriv = (WeatherPluginPrivate *) pData;
+  WeatherPluginPrivate * priv = (WeatherPluginPrivate *) data;
 
-  LXW_LOG(LXW_DEBUG, "weather_destructor(%d): %d", pPriv->iMyId_, g_iCount);
+  LXW_LOG(LXW_DEBUG,
+          "weather_destructor(%d): %d",
+          priv->myid_,
+          g_instancecnt);
 
-  g_free(pPriv);
+  g_free(priv);
 
-  --g_iCount;
+  --g_instancecnt;
 
-  if (g_iCount == 0)
-    {
-      cleanupYahooUtil();
-
-      cleanupLogUtil();
-    }
+  if (g_instancecnt == 0) {
+    yahooutil_cleanup();
+    logutil_cleanup();
+  }
 }
 
 /**
  * Weather Plugin constructor
  *
- * @param pPlugin Pointer to the PluginClass wrapper instance.
- * @param setting Pointer to the configuration settings for this plugin.
+ * @param panel  Pointer to the panel where this instance is being loaded.
+ * @param config Pointer to the configuration settings for this plugin.
  *
  * @return Pointer to a new weather widget.
  */
 static GtkWidget *
-weather_constructor(LXPanel *pPanel, config_setting_t *pConfig)
+weather_constructor(LXPanel *panel, config_setting_t *config)
 {
-  WeatherPluginPrivate * pPriv = g_new0(WeatherPluginPrivate, 1);
+  WeatherPluginPrivate * priv = g_new0(WeatherPluginPrivate, 1);
 
-  pPriv->pConfig_ = pConfig;
-  pPriv->pPanel_ = pPanel;
+  priv->config_ = config;
+  priv->panel_  = panel;
 
   /* There is one more now... */
-  ++g_iCount;
+  ++g_instancecnt;
 
-  pPriv->iMyId_ = g_iCount;
+  priv->myid_ = g_instancecnt;
 
-  if (g_iCount == 1)
-    {
-      initializeLogUtil("syslog");
+  if (g_instancecnt == 1) {
+    logutil_init("syslog");
       
-      setMaxLogLevel(LXW_ERROR);
+    logutil_max_loglevel_set(LXW_ERROR);
 
-      initializeYahooUtil();
-    }
+    yahooutil_init();
+  }
 
   LXW_LOG(LXW_DEBUG, "weather_constructor()");
   
-  GtkWidget * pWidg = gtk_weather_new();
+  GtkWidget * weather = gtk_weather_new();
 
-  pPriv->pWeather_ = pWidg;
+  priv->weather_ = weather;
 
-  GtkWidget * pEventBox = gtk_event_box_new();
+  GtkWidget * eventbox = gtk_event_box_new();
 
-  lxpanel_plugin_set_data(pEventBox, pPriv, weather_destructor);
-  gtk_container_add(GTK_CONTAINER(pEventBox), pWidg);
+  lxpanel_plugin_set_data(eventbox, priv, weather_destructor);
+  gtk_container_add(GTK_CONTAINER(eventbox), weather);
 
-  gtk_widget_set_has_window(pEventBox, FALSE);
+  gtk_widget_set_has_window(eventbox, FALSE);
 
-  gtk_widget_show_all(pEventBox);
+  gtk_widget_show_all(eventbox);
 
   /* use config settings */
-  LocationInfo * pLocation = g_new0(LocationInfo, 1);
-  const char *pczDummy = NULL;
-  int iDummyVal = 0;
+  LocationInfo * location = g_new0(LocationInfo, 1);
+  const char   * dummystr = NULL;
+  int            dummyint = 0;
 
-  if (config_setting_lookup_string(pConfig, "alias", &pczDummy))
-    {
-      pLocation->pcAlias_ = g_strndup(pczDummy, (pczDummy) ? strlen(pczDummy) : 0);
-    }
-  else if (config_setting_lookup_int(pConfig, "alias", &iDummyVal))
-    {
-      pLocation->pcAlias_ = g_strdup_printf("%d", iDummyVal);
-    }
-  else
-    {
-      LXW_LOG(LXW_ERROR, "Weather: could not lookup alias in config.");
-    }
+  if (config_setting_lookup_string(config, "alias", &dummystr)) {
+    location->alias_ = g_strndup(dummystr, (dummystr) ? strlen(dummystr) : 0);
+  } else if (config_setting_lookup_int(config, "alias", &dummyint)) {
+    location->alias_ = g_strdup_printf("%d", dummyint);
+  } else {
+    LXW_LOG(LXW_ERROR, "Weather: could not lookup alias in config.");
+  }
 
-  if (config_setting_lookup_string(pConfig, "city", &pczDummy))
-    {
-      pLocation->pcCity_ = g_strndup(pczDummy, (pczDummy) ? strlen(pczDummy) : 0);
-    }
-  else
-    {
-      LXW_LOG(LXW_ERROR, "Weather: could not lookup city in config.");
-    }
+  if (config_setting_lookup_string(config, "city", &dummystr)) {
+    location->city_ = g_strndup(dummystr, (dummystr) ? strlen(dummystr) : 0);
+  } else {
+    LXW_LOG(LXW_ERROR, "Weather: could not lookup city in config.");
+  }
 
-  if (config_setting_lookup_string(pConfig, "state", &pczDummy))
-    {
-      pLocation->pcState_ = g_strndup(pczDummy, (pczDummy) ? strlen(pczDummy) : 0);
-    }
-  else
-    {
-      LXW_LOG(LXW_ERROR, "Weather: could not lookup state in config.");
-    }
+  if (config_setting_lookup_string(config, "state", &dummystr)) {
+    location->state_ = g_strndup(dummystr, (dummystr) ? strlen(dummystr) : 0);
+  } else {
+    LXW_LOG(LXW_ERROR, "Weather: could not lookup state in config.");
+  }
 
-  if (config_setting_lookup_string(pConfig, "country", &pczDummy))
-    {
-      pLocation->pcCountry_ = g_strndup(pczDummy, (pczDummy) ? strlen(pczDummy) : 0);
-    }
-  else
-    {
-      LXW_LOG(LXW_ERROR, "Weather: could not lookup country in config.");
-    }
+  if (config_setting_lookup_string(config, "country", &dummystr)) {
+    location->country_ = g_strndup(dummystr, (dummystr) ? strlen(dummystr) : 0);
+  } else {
+    LXW_LOG(LXW_ERROR, "Weather: could not lookup country in config.");
+  }
 
-  if (config_setting_lookup_string(pConfig, "woeid", &pczDummy))
-    {
-      pLocation->pcWOEID_ = g_strndup(pczDummy, (pczDummy) ? strlen(pczDummy) : 0);
-    }
-  else if (config_setting_lookup_int(pConfig, "woeid", &iDummyVal))
-    {
-      pLocation->pcWOEID_ = g_strdup_printf("%d", iDummyVal);
-    }
-  else
-    {
-      LXW_LOG(LXW_ERROR, "Weather: could not lookup woeid in config.");
-    }
+  if (config_setting_lookup_string(config, "woeid", &dummystr)) {
+    location->woeid_ = g_strndup(dummystr, (dummystr) ? strlen(dummystr) : 0);
+  } else if (config_setting_lookup_int(config, "woeid", &dummyint)) {
+    location->woeid_ = g_strdup_printf("%d", dummyint);
+  } else {
+    LXW_LOG(LXW_ERROR, "Weather: could not lookup woeid in config.");
+  }
 
-  if (config_setting_lookup_string(pConfig, "units", &pczDummy))
-    {
-      pLocation->cUnits_ = pczDummy[0];
-    }
-  else
-    {
-      LXW_LOG(LXW_ERROR, "Weather: could not lookup units in config.");
-    }
+  if (config_setting_lookup_string(config, "units", &dummystr)) {
+    location->units_ = dummystr[0];
+  } else {
+    LXW_LOG(LXW_ERROR, "Weather: could not lookup units in config.");
+  }
 
-  if (config_setting_lookup_int(pConfig, "interval", &iDummyVal))
-    {
-      pLocation->uiInterval_ = (guint)iDummyVal;
-    }
-  else
-    {
-      LXW_LOG(LXW_ERROR, "Weather: could not lookup interval in config.");
-    }
+  if (config_setting_lookup_int(config, "interval", &dummyint)) {
+    location->interval_ = (guint)dummyint;
+  } else {
+    LXW_LOG(LXW_ERROR, "Weather: could not lookup interval in config.");
+  }
 
-  iDummyVal = 0;
-  if (config_setting_lookup_int(pConfig, "enabled", &iDummyVal))
-    {
-      pLocation->bEnabled_ = (gint)iDummyVal;
-    }
-  else
-    {
-      LXW_LOG(LXW_ERROR, "Weather: could not lookup enabled flag in config.");
-    }
+  dummyint = 0;
+  if (config_setting_lookup_int(config, "enabled", &dummyint)) {
+    location->enabled_ = (gint)dummyint;
+  } else {
+    LXW_LOG(LXW_ERROR, "Weather: could not lookup enabled flag in config.");
+  }
 
-  if (pLocation->pcAlias_ && pLocation->pcWOEID_)
-    {
-      GValue locationValue = G_VALUE_INIT;
+  if (location->alias_ && location->woeid_) {
+    GValue locval = G_VALUE_INIT;
 
-      g_value_init(&locationValue, G_TYPE_POINTER);
+    g_value_init(&locval, G_TYPE_POINTER);
 
-      /* location is copied by the widget */
-      g_value_set_pointer(&locationValue, pLocation);
+    /* location is copied by the widget */
+    g_value_set_pointer(&locval, location);
 
-      g_object_set_property(G_OBJECT(pWidg),
-                            "location",
-                            &locationValue);
-    }
+    g_object_set_property(G_OBJECT(weather), "location", &locval);
+  }
 
-  freeLocation(pLocation);
+  location_free(location);
 
-  return pEventBox;
+  return eventbox;
 }
 
 /**
  * Weather Plugin callback to save configuration
  *
- * @param pWidget Pointer to this widget.
+ * @param widget   Pointer to this widget.
+ * @param location Pointer to the current location.
  */
-void weather_save_configuration(GtkWidget * pWeather, LocationInfo * pLocation)
+void weather_save_configuration(GtkWidget * widget, LocationInfo * location)
 {
-  GtkWidget * pWidget = gtk_widget_get_parent(pWeather);
-  WeatherPluginPrivate * pPriv = NULL;
+  GtkWidget * parent = gtk_widget_get_parent(widget);
+  WeatherPluginPrivate * priv = NULL;
 
-  if (pWidget)
-    {
-      pPriv = (WeatherPluginPrivate *) lxpanel_plugin_get_data(pWidget);
+  if (parent) {
+    priv = (WeatherPluginPrivate *) lxpanel_plugin_get_data(parent);
+  }
+
+  if (priv == NULL) {
+    LXW_LOG(LXW_ERROR, "Weather: weather_save_configuration() for invalid widget");
+    return;
+  }
+
+  LXW_LOG(LXW_DEBUG, "weather_save_configuration(%d)", priv->myid_);
+
+  if (location) {
+    /* save configuration */
+    config_group_set_string(priv->config_, "alias",   location->alias_);
+    config_group_set_string(priv->config_, "city",    location->city_);
+    config_group_set_string(priv->config_, "state",   location->state_);
+    config_group_set_string(priv->config_, "country", location->country_);
+    config_group_set_string(priv->config_, "woeid",   location->woeid_);
+
+    char units[2] = {0};
+    if (snprintf(units, 2, "%c", location->units_) > 0) {
+      config_group_set_string(priv->config_, "units", units);
     }
-  if (pPriv == NULL)
-    {
-      LXW_LOG(LXW_ERROR, "Weather: weather_save_configuration() for invalid widget");
-      return;
-    }
 
-  LXW_LOG(LXW_DEBUG, "weather_save_configuration(%d)", pPriv->iMyId_);
-
-  if (pLocation)
-    {
-      /* save configuration */
-      config_group_set_string(pPriv->pConfig_, "alias", pLocation->pcAlias_);
-      config_group_set_string(pPriv->pConfig_, "city", pLocation->pcCity_);
-      config_group_set_string(pPriv->pConfig_, "state", pLocation->pcState_);
-      config_group_set_string(pPriv->pConfig_, "country", pLocation->pcCountry_);
-      config_group_set_string(pPriv->pConfig_, "woeid", pLocation->pcWOEID_);
-
-      char units[2] = {0};
-      if (snprintf(units, 2, "%c", pLocation->cUnits_) > 0)
-        {
-          config_group_set_string(pPriv->pConfig_, "units", units);
-        }
-
-      config_group_set_int(pPriv->pConfig_, "interval", (int) pLocation->uiInterval_);
-      config_group_set_int(pPriv->pConfig_, "enabled", (int) pLocation->bEnabled_);
-    }
+    config_group_set_int(priv->config_, "interval", (int) location->interval_);
+    config_group_set_int(priv->config_, "enabled", (int) location->enabled_);
+  }
 
 }
 
-void weather_set_label_text(GtkWidget * pWeather, GtkWidget * label, const gchar * text)
+/**
+ * Sets the temperature text for the label next to the icon.
+ *
+ * @param widget Pointer to the weather widget.
+ * @param label  Pointer to the label widget.
+ * @param text   String to put on the label.
+ *
+ */
+void weather_set_label_text(GtkWidget   * widget,
+                            GtkWidget   * label,
+                            const gchar * text)
 {
-  GtkWidget * pWidget = gtk_widget_get_parent(pWeather);
-  WeatherPluginPrivate * pPriv = NULL;
+  GtkWidget * parent = gtk_widget_get_parent(widget);
 
-  if (pWidget)
-    {
-      pPriv = (WeatherPluginPrivate *) lxpanel_plugin_get_data(pWidget);
-    }
-  if (pPriv == NULL)
-    {
-      LXW_LOG(LXW_ERROR, "Weather: weather_set_label_text() for invalid widget");
-      return;
-    }
+  WeatherPluginPrivate * priv = NULL;
 
-  lxpanel_draw_label_text(pPriv->pPanel_, label, text, TRUE, 1, TRUE);
+  if (parent)  {
+      priv = (WeatherPluginPrivate *) lxpanel_plugin_get_data(parent);
+  }
+
+  if (priv == NULL) {
+    LXW_LOG(LXW_ERROR, "Weather: weather_set_label_text() for invalid widget");
+    return;
+  }
+
+  lxpanel_draw_label_text(priv->panel_, label, text, TRUE, 1, TRUE);
 }
 
 /**
  * Weather Plugin configuration change callback.
  *
- * @param pPanel  Pointer to the panel instance.
- * @param pPlugin Pointer to the PluginClass wrapper instance.
+ * @param panel  Pointer to the panel instance.
+ * @param widget Pointer to this widget.
  */
 static void
-weather_configuration_changed(LXPanel *pPanel, GtkWidget *pWidget)
+weather_configuration_changed(LXPanel * panel, GtkWidget * widget)
 {
   LXW_LOG(LXW_DEBUG, "weather_configuration_changed()");
 
-  if (pPanel && pWidget)
-    {
-      LXW_LOG(LXW_DEBUG, 
-             "   orientation: %s, width: %d, height: %d, icon size: %d\n", 
-              (panel_get_orientation(pPanel) == GTK_ORIENTATION_HORIZONTAL)?"HORIZONTAL":
-              (panel_get_orientation(pPanel) == GTK_ORIENTATION_VERTICAL)?"VERTICAL":"NONE",
-              pPanel->width, panel_get_height(pPanel), 
-              panel_get_icon_size(pPanel));
-    }
+  if (panel && widget) {
+    LXW_LOG(LXW_DEBUG, 
+            "   orientation: %s, width: %d, height: %d, icon size: %d\n", 
+            (panel_get_orientation(panel) == GTK_ORIENTATION_HORIZONTAL)?"HORIZONTAL":
+            (panel_get_orientation(panel) == GTK_ORIENTATION_VERTICAL)?"VERTICAL":"NONE",
+            panel->width, panel_get_height(panel), 
+            panel_get_icon_size(panel));
+  }
 }
 
 /**
  * Weather Plugin configuration dialog callback.
  *
- * @param pPanel  Pointer to the panel instance.
- * @param pWidget Pointer to the Plugin widget instance.
+ * @param panel  Pointer to the panel instance.
+ * @param widget Pointer to the Plugin widget instance.
  * @param pParent Pointer to the GtkWindow parent.
  *
  * @return Instance of the widget.
  */
 static GtkWidget *
-weather_configure(LXPanel *pPanel G_GNUC_UNUSED, GtkWidget *pWidget)
+weather_configure(LXPanel *panel G_GNUC_UNUSED, GtkWidget *widget)
 {
   LXW_LOG(LXW_DEBUG, "weather_configure()");
 
-  WeatherPluginPrivate * pPriv = (WeatherPluginPrivate *) lxpanel_plugin_get_data(pWidget);
+  WeatherPluginPrivate * priv =
+    (WeatherPluginPrivate *) lxpanel_plugin_get_data(widget);
 
-  GtkWidget * pDialog = gtk_weather_create_preferences_dialog(GTK_WIDGET(pPriv->pWeather_));
+  GtkWidget * dialog =
+    gtk_weather_create_preferences_dialog(GTK_WIDGET(priv->weather_));
 
-  return pDialog;
+  return dialog;
 }
 
 FM_DEFINE_MODULE(lxpanel_gtk, weather)
@@ -328,13 +304,12 @@ FM_DEFINE_MODULE(lxpanel_gtk, weather)
  * Definition of the weather plugin module
  */
 LXPanelPluginInit fm_module_init_lxpanel_gtk =
-  {
-    .name = N_("Weather Plugin"),
-    .description = N_("Show weather conditions for a location."),
+{
+  .name        = N_("Weather Plugin"),
+  .description = N_("Show weather conditions for a location."),
 
-    // API functions
-    .new_instance = weather_constructor,
-    .config = weather_configure,
-    .reconfigure = weather_configuration_changed
-  };
-#endif /* USE_STANDALONE */
+  // API functions
+  .new_instance = weather_constructor,
+  .config       = weather_configure,
+  .reconfigure  = weather_configuration_changed
+};

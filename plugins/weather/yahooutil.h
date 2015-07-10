@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2012-2014 Piotr Sipika; see the AUTHORS file for more.
+ * Copyright (c) 2012-2015 Piotr Sipika; see the AUTHORS file for more.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -28,38 +28,41 @@
 /**
  * Retrieves the details for the specified location
  *
- * @param pczLocation The string containing the name/code of the location
+ * @param location The string containing the name/code of the location
  *
  * @return A pointer to a list of LocationInfo entries, possibly empty, 
  *         if no details were found. Caller is responsible for freeing the list.
  */
 GList *
-getLocationInfo(const gchar * pczLocation);
+yahooutil_location_find(const gchar * location);
 
 /**
  * Retrieves the forecast for the specified location WOEID
  *
- * @param pczWOEID The string containing the WOEID of the location
- * @param czUnits The character containing the units for the forecast (c|f)
- * @param pForecast The pointer to the forecast to be filled. If set to NULL,
- *                  a new one will be allocated.
+ * @param woeid The string containing the WOEID of the location
+ * @param units The character containing the units for the forecast (c|f)
+ * @param forecast The pointer to the forecast to be filled. If set to NULL,
+ *                 a new one will be allocated.
  *
  */
 void
-getForecastInfo(const gchar * pczWOEID, const gchar czUnits, gpointer pForecast);
+yahooutil_forecast_get(const gchar * woeid, const gchar units, gpointer forecast);
 
 /**
  * Initializes the internals: XML and HTTP
  *
  */
 void
-initializeYahooUtil(void);
+yahooutil_init(void);
 
 /**
  * Cleans up the internals: XML and HTTP
  *
  */
 void
-cleanupYahooUtil(void);
+yahooutil_cleanup(void);
+
+gint
+forecast_response_parse(gpointer response, gpointer * forecast);
 
 #endif
