@@ -1109,10 +1109,6 @@ gtk_weather_preferences_dialog_response(GtkDialog * dialog G_GNUC_UNUSED,
     break;
   }
 
-  if (GTK_IS_WIDGET(priv->preferences_data.dialog)) {
-    gtk_widget_destroy(priv->preferences_data.dialog);
-  }
-
   priv->preferences_data.dialog = NULL;
   priv->preferences_data.shown  = FALSE;
 
