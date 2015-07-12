@@ -26,8 +26,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#define SAFE_STRNDUP(p, v)                       \
+  do {                                           \
+    if (!v) break;                               \
+    p = g_strndup((v), strlen(v));               \
+  } while (0);
+
 /**
- * Provides the mechanism to free any data associated with 
+ * Provides the mechanism to free all data associated with
  * the ForecastDay structure
  *
  * @param day Entry to free.
@@ -41,7 +47,25 @@ forecast_forecastday_free(ForecastDay * day)
 }
 
 /**
- * Provides the mechanism to free any data associated with 
+ * Provides the mechanism to copy all data associated with
+ * the ForecastDay structure
+ *
+ * @param dst Pointer to copy to.
+ * @param src Pointer to copy from.
+ */
+static void
+forecast_forecastday_copy(ForecastDay * dst, ForecastDay * src)
+{
+  SAFE_STRNDUP(dst->day_,        src->day_);
+  SAFE_STRNDUP(dst->conditions_, src->conditions_);
+
+  dst->high_ = src->high_;
+  dst->low_  = src->low_;
+  dst->code_ = src->code_;
+}
+
+/**
+ * Provides the mechanism to free all data associated with
  * the ForecastUnits structure
  *
  * @param units Entry to free.
@@ -57,7 +81,24 @@ forecast_units_free(ForecastUnits * units)
 }
 
 /**
- * Provides the mechanism to free any data associated with 
+ * Provides the mechanism to copy all data associated with
+ * the ForecastUnits structure
+ *
+ * @param dst Pointer to copy to.
+ * @param src Pointer to copy from.
+ *
+ */
+static void
+forecast_units_copy(ForecastUnits * dst, ForecastUnits * src )
+{
+  SAFE_STRNDUP(dst->distance_,    src->distance_);
+  SAFE_STRNDUP(dst->pressure_,    src->pressure_);
+  SAFE_STRNDUP(dst->speed_,       src->speed_);
+  SAFE_STRNDUP(dst->temperature_, src->temperature_);
+}
+
+/**
+ * Provides the mechanism to free any data associated with
  * the ForecastInfo structure
  *
  * @param forecast Entry to free.
