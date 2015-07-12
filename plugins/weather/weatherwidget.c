@@ -151,7 +151,7 @@ enum
   LAST_SIGNAL
 };
 
-enum 
+enum
 {
   PROP_0,
   PROP_LOCATION,
@@ -449,9 +449,9 @@ gtk_weather_size_allocate(GtkWidget * widget, GtkAllocation * allocation)
 
   if (gtk_widget_get_realized(widget) && weather_has_window) {
       gdk_window_move_resize(gtk_widget_get_window(widget),
-                             allocation->x, 
-                             allocation->y, 
-                             allocation->width, 
+                             allocation->x,
+                             allocation->y,
+                             allocation->width,
                              allocation->height);
     }
    
@@ -692,12 +692,6 @@ gtk_weather_set_location(GtkWeather * weather, gpointer location, gboolean backu
  *
  * @param weather  Pointer to the instance of this widget.
  * @param forecast Forecast to use.
- *
- * @note I realize there is a slight inconsistency here:
- *       The set_location() function properly sets the location, while this
- *       function (set_forecast()) does not.  This is because the forecast
- *       is being modified in-place inside its thread function.
- *       It is not the most nimble approach and should be changed in the future.
  */
 static void
 gtk_weather_set_forecast(GtkWeather * weather, gpointer forecast)
@@ -713,11 +707,7 @@ gtk_weather_set_forecast(GtkWeather * weather, gpointer forecast)
 #endif
 
   if (pthread_rwlock_wrlock(&(priv->rwlock)) == 0) {
-    if (!forecast) {
-      forecast_free(priv->forecast);
-
-      priv->forecast = NULL;
-    }
+    forecast_copy(&priv->forecast, forecast);
     
     pthread_rwlock_unlock(&(priv->rwlock));
   }
@@ -807,12 +797,10 @@ gtk_weather_auto_update_toggled(GtkWidget * widget)
  * @return TRUE if the event should not be propagated further, FALSE otherwise.
  */
 static gboolean
-gtk_weather_change_location(GtkWidget * widget, GdkEventButton * event)
+gtk_weather_change_location(GtkWidget      * widget,
+                            GdkEventButton * event G_GNUC_UNUSED)
 {
   LXW_LOG(LXW_DEBUG, "GtkWeather::change_location");
-
-  /* disable compilation warning */
-  (void)event;
 
   GtkWeatherPrivate * priv = GTK_WEATHER_GET_PRIVATE(GTK_WEATHER(widget));
 
@@ -1051,10 +1039,10 @@ gtk_weather_run_error_dialog(GtkWindow * parent, gchar * error_msg)
  * @param data     Pointer to user data (weather widget instance).
  */
 void
-gtk_weather_preferences_dialog_response(GtkDialog *dialog, gint response, gpointer data)
+gtk_weather_preferences_dialog_response(GtkDialog * dialog G_GNUC_UNUSED,
+                                        gint        response,
+                                        gpointer    data)
 {
-  (void) dialog; /* unused - to squash a warning */
-
   LXW_LOG(LXW_DEBUG, "GtkWeather::popup_menu(%d)", response);
 
   GtkWeather * weather = GTK_WEATHER(data);
@@ -1093,9 +1081,6 @@ gtk_weather_preferences_dialog_response(GtkDialog *dialog, gint response, gpoint
         weather_save_configuration(GTK_WIDGET(weather), location);
 
         pthread_rwlock_unlock(&(priv->rwlock));
-
-        /* get forecast */
-        gtk_weather_get_forecast(GTK_WIDGET(weather));
       } else {
         pthread_rwlock_unlock(&(priv->rwlock));
       }
@@ -1105,9 +1090,12 @@ gtk_weather_preferences_dialog_response(GtkDialog *dialog, gint response, gpoint
 
   case GTK_RESPONSE_REJECT:
     if (pthread_rwlock_rdlock(&(priv->rwlock)) == 0) {
-      if (priv->previous_location) {
+      if (priv->previous_location &&
+          strcmp(((LocationInfo *) priv->previous_location)->woeid_,
+                 ((LocationInfo *) priv->location)->woeid_)) {
         pthread_rwlock_unlock(&(priv->rwlock));
 
+        /* only set the location to previous one if they differ */
         /* write lock is used inside */
         gtk_weather_set_location(weather, priv->previous_location, FALSE);
       } else {
@@ -1115,8 +1103,6 @@ gtk_weather_preferences_dialog_response(GtkDialog *dialog, gint response, gpoint
       }
     }
       
-    gtk_weather_get_forecast(GTK_WIDGET(weather));
-
     break;
   default:
     /* Leave everything as-is*/
@@ -1129,6 +1115,9 @@ gtk_weather_preferences_dialog_response(GtkDialog *dialog, gint response, gpoint
 
   priv->preferences_data.dialog = NULL;
   priv->preferences_data.shown  = FALSE;
+
+  /* get forecast */
+  gtk_weather_get_forecast(GTK_WIDGET(weather));
 }
 
 /**
@@ -1872,8 +1861,8 @@ gtk_weather_run_conditions_dialog(GtkWidget * widget)
 
   /* clang --analyze complains that priv may be null, not sure how, though */
   if (pthread_rwlock_rdlock(&(priv->rwlock)) == 0) {
-    location = (LocationInfo *)priv->location;
-    forecast = (ForecastInfo *)priv->forecast;
+    location = (LocationInfo *) priv->location;
+    forecast = (ForecastInfo *) priv->forecast;
 
     /* for the error message */
     alias = (location) ? location->alias_ : _("N/A");
@@ -2067,9 +2056,17 @@ gtk_weather_update_ui(gpointer data)
 
   GtkWeather        * weather = GTK_WEATHER(data);
   GtkWeatherPrivate * priv    = GTK_WEATHER_GET_PRIVATE(weather);
-  
-  /* render happens inside, need to emit the changed signal */
-  gtk_weather_set_forecast(weather, priv->forecast);
+
+  /* gtk_weather_set_forecast(weather, priv->forecast_data.pending_forecast); */
+  gtk_weather_render(weather);
+
+  /* Emit forecast-changed event */
+  g_signal_emit_by_name(weather, "forecast-changed", priv->forecast);
+
+  /* Update the conditions dialog, if shown */
+  if (priv->conditions_data.shown) {
+    gtk_weather_update_conditions_dialog(weather);
+  }
 
   return FALSE;
 }
@@ -2443,7 +2440,7 @@ gtk_weather_forecast_thread_stop(GtkWeather * weather)
       LXW_LOG(LXW_ERROR, "Could not join thread: %d", errno);
     }
   }
-  
+
   return rc;
 }
 
@@ -2598,23 +2595,40 @@ gtk_weather_get_forecast_threadfunc(void * arg)
 
     initial = FALSE;
 
-    /* write lock */
-    LXW_LOG(LXW_DEBUG, "\tabout to writelock");
-    if (pthread_rwlock_wrlock(&(priv->rwlock)) == 0) {
+    const gchar  * woeid    = NULL;
+    gchar          units    = 'f';
+
+    if (pthread_rwlock_rdlock(&(priv->rwlock)) == 0) {
       location = (LocationInfo *) priv->location;
 
-      LXW_LOG(LXW_DEBUG, "\tgetting forecast for %s", location->woeid_);
-
-      yahooutil_forecast_get(location->woeid_,
-                             location->units_, 
-                             &(priv->forecast));
+      woeid = location->woeid_;
+      units = location->units_;
 
       pthread_rwlock_unlock(&(priv->rwlock));
+    } else {
+      LXW_LOG(LXW_ERROR, "Unable to acquire read lock.");
+
+      continue;
+    }
+
+    LXW_LOG(LXW_DEBUG, "\tgetting forecast for %s", woeid);
+
+    ForecastInfo * forecast = NULL;
+    yahooutil_forecast_get(woeid, units, &forecast);
+
+    if (forecast) {
+      if (pthread_rwlock_wrlock(&(priv->rwlock)) == 0) {
+        forecast_copy(&(priv->forecast), forecast);
+
+        pthread_rwlock_unlock(&(priv->rwlock));
+      }
 
       /* render on main thread */
       g_idle_add(gtk_weather_update_ui, weather);
+
+      forecast_free(forecast);
     }
-    
+
   }
 
   return NULL;

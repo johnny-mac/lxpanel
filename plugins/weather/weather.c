@@ -201,7 +201,8 @@ void weather_save_configuration(GtkWidget * widget, LocationInfo * location)
   }
 
   if (priv == NULL) {
-    LXW_LOG(LXW_ERROR, "Weather: weather_save_configuration() for invalid widget");
+    LXW_LOG(LXW_ERROR,
+            "Weather: weather_save_configuration() for invalid widget");
     return;
   }
 
@@ -270,7 +271,7 @@ weather_configuration_changed(LXPanel * panel, GtkWidget * widget)
             "   orientation: %s, width: %d, height: %d, icon size: %d\n", 
             (panel_get_orientation(panel) == GTK_ORIENTATION_HORIZONTAL)?"HORIZONTAL":
             (panel_get_orientation(panel) == GTK_ORIENTATION_VERTICAL)?"VERTICAL":"NONE",
-            panel->width, panel_get_height(panel), 
+            panel_get_width(panel), panel_get_height(panel),
             panel_get_icon_size(panel));
   }
 }

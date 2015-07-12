@@ -1887,6 +1887,11 @@ gint panel_get_height(LXPanel *panel)
     return panel->priv->height;
 }
 
+gint panel_get_width(LXPanel *panel)
+{
+    return panel->priv->width;
+}
+
 Window panel_get_xwindow(LXPanel *panel)
 {
     return panel->priv->topxwin;
